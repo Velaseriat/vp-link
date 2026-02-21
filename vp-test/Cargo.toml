@@ -1,0 +1,11 @@
+[package]
+name = "vp-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ashpd = "0.12"
+evdev = "0.13"
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+tokio = { version = "1.43", features = ["rt", "time"] }
