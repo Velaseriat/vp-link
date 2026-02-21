@@ -1,4 +1,4 @@
-# vp-sync Status
+# vp-link Status
 
 ## Current Goal
 
