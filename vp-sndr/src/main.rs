@@ -34,6 +34,8 @@ const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
 const DEFAULT_MOUSE_SAMPLE_INTERVAL_SECS: f64 = 0.5;
 const DEFAULT_MOUSE_SMOOTHING: f64 = 8.0;
+const DEFAULT_CURSOR_CHANGE_EPSILON_PX: f64 = 0.25;
+const DEFAULT_SETTLE_EPSILON_PX: f64 = 0.75;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -331,8 +333,7 @@ struct FollowState {
     cursor_y: f64,
     target_x: f64,
     target_y: f64,
-    follow_active: bool,
-    next_sample_at: Instant,
+    is_lerping: bool,
     last_frame_at: Instant,
 }
 
@@ -438,8 +439,7 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
         cursor_y: cfg.y as f64 + cfg.height as f64 / 2.0,
         target_x: cfg.x as f64 + cfg.width as f64 / 2.0,
         target_y: cfg.y as f64 + cfg.height as f64 / 2.0,
-        follow_active: false,
-        next_sample_at: Instant::now(),
+        is_lerping: false,
         last_frame_at: Instant::now(),
     }));
     let out_idx = Arc::new(Mutex::new(0u64));
@@ -457,7 +457,6 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
     let cfg_y = cfg.y;
     let cfg_output_fps = output_fps;
     let cfg_frame_skip = cfg.frame_skip;
-    let cfg_sample_interval = cfg.sample_interval_secs;
     let cfg_smoothing = cfg.smoothing;
 
     appsink.set_callbacks(
@@ -491,18 +490,28 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
                     let prev_cursor_y = st.cursor_y;
 
                     if cfg_follow {
+                        let mut used_stream_meta = false;
+                        if let Some((mx, my)) = extract_cursor_from_sample(&sample, src_w as u32, src_h as u32) {
+                            st.cursor_x = mx;
+                            st.cursor_y = my;
+                            used_stream_meta = true;
+                        }
+
                         let mut used_cosmic = false;
-                        if let Some(cosmic_xy) = &cosmic_cursor {
-                            if let Ok(guard) = cosmic_xy.lock() {
-                                if let Some((mx, my)) = *guard {
-                                    st.cursor_x = mx;
-                                    st.cursor_y = my;
-                                    saw_cosmic_cursor_cb.store(true, Ordering::Relaxed);
-                                    used_cosmic = true;
+                        if !used_stream_meta {
+                            if let Some(cosmic_xy) = &cosmic_cursor {
+                                if let Ok(guard) = cosmic_xy.lock() {
+                                    if let Some((mx, my)) = *guard {
+                                        st.cursor_x = mx;
+                                        st.cursor_y = my;
+                                        saw_cosmic_cursor_cb.store(true, Ordering::Relaxed);
+                                        used_cosmic = true;
+                                    }
                                 }
                             }
                         }
-                        if !used_cosmic {
+
+                        if !used_stream_meta && !used_cosmic {
                             if let Some(deltas) = &mouse_deltas {
                                 let mut d = deltas.lock().map_err(|_| gst::FlowError::Error)?;
                                 st.cursor_x += d.0;
@@ -517,44 +526,37 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
                     let max_cursor_y = (src_h.saturating_sub(1)) as f64;
                     st.cursor_x = st.cursor_x.clamp(0.0, max_cursor_x);
                     st.cursor_y = st.cursor_y.clamp(0.0, max_cursor_y);
-
                     if cfg_follow {
-                        let cursor_moved = (st.cursor_x - prev_cursor_x).abs() > 0.001
-                            || (st.cursor_y - prev_cursor_y).abs() > 0.001;
-                        let left = (st.center_x - cfg_width as f64 / 2.0)
-                            .clamp(0.0, (src_w - out_w) as f64);
-                        let top = (st.center_y - cfg_height as f64 / 2.0)
-                            .clamp(0.0, (src_h - out_h) as f64);
-                        let right = left + cfg_width as f64;
-                        let bottom = top + cfg_height as f64;
-                        let in_bounds = st.cursor_x >= left
-                            && st.cursor_x < right
-                            && st.cursor_y >= top
-                            && st.cursor_y < bottom;
-                        let prev_follow = st.follow_active;
-                        st.follow_active = !in_bounds;
-                        if !st.follow_active {
-                            st.target_x = st.center_x;
-                            st.target_y = st.center_y;
-                        } else if cursor_moved || !prev_follow {
+                        let cursor_changed = (st.cursor_x - prev_cursor_x).abs() > DEFAULT_CURSOR_CHANGE_EPSILON_PX
+                            || (st.cursor_y - prev_cursor_y).abs() > DEFAULT_CURSOR_CHANGE_EPSILON_PX;
+                        if cursor_changed {
                             st.target_x = st.cursor_x;
                             st.target_y = st.cursor_y;
-                        }
-                        if now >= st.next_sample_at {
-                            st.next_sample_at = now + Duration::from_secs_f64(cfg_sample_interval);
+                            st.is_lerping = true;
                         }
                     } else {
                         st.center_x = cfg_x as f64 + cfg_width as f64 / 2.0;
                         st.center_y = cfg_y as f64 + cfg_height as f64 / 2.0;
                         st.target_x = st.center_x;
                         st.target_y = st.center_y;
+                        st.is_lerping = false;
                     }
 
                     let dt = (now - st.last_frame_at).as_secs_f64().max(0.000_001);
                     st.last_frame_at = now;
-                    let alpha = 1.0 - (-cfg_smoothing * dt).exp();
-                    st.center_x += (st.target_x - st.center_x) * alpha;
-                    st.center_y += (st.target_y - st.center_y) * alpha;
+                    if st.is_lerping {
+                        let alpha = 1.0 - (-cfg_smoothing * dt).exp();
+                        st.center_x += (st.target_x - st.center_x) * alpha;
+                        st.center_y += (st.target_y - st.center_y) * alpha;
+                        let dx = st.target_x - st.center_x;
+                        let dy = st.target_y - st.center_y;
+                        let settle2 = DEFAULT_SETTLE_EPSILON_PX * DEFAULT_SETTLE_EPSILON_PX;
+                        if dx * dx + dy * dy <= settle2 {
+                            st.center_x = st.target_x;
+                            st.center_y = st.target_y;
+                            st.is_lerping = false;
+                        }
+                    }
                     let max_x = (src_w - out_w) as f64;
                     let max_y = (src_h - out_h) as f64;
                     let cx = (st.center_x - cfg_width as f64 / 2.0).clamp(0.0, max_x).round() as usize;
@@ -997,6 +999,36 @@ fn start_mouse_delta_tracker() -> Result<Arc<Mutex<(f64, f64)>>, String> {
         thread::sleep(Duration::from_millis(2));
     });
     Ok(deltas)
+}
+
+fn extract_cursor_from_sample(sample: &gst::Sample, src_w: u32, src_h: u32) -> Option<(f64, f64)> {
+    let buffer = sample.buffer()?;
+    for meta in buffer.iter_meta::<gst::Meta>() {
+        if let Some(custom) = meta.try_as_custom_meta() {
+            let st = custom.structure();
+            let name = st.name().as_str().to_ascii_lowercase();
+            let looks_cursor = name.contains("cursor") || name.contains("pointer");
+            if !looks_cursor {
+                continue;
+            }
+            if let Some((x, y)) = read_xy_from_structure(st, src_w, src_h) {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+fn read_xy_from_structure(st: &gst::StructureRef, src_w: u32, src_h: u32) -> Option<(f64, f64)> {
+    let x_num = st.get::<f64>("x").ok().or_else(|| st.get::<i32>("x").ok().map(|v| v as f64))?;
+    let y_num = st.get::<f64>("y").ok().or_else(|| st.get::<i32>("y").ok().map(|v| v as f64))?;
+    if x_num >= 0.0 && y_num >= 0.0 && x_num <= src_w as f64 && y_num <= src_h as f64 {
+        Some((x_num, y_num))
+    } else if x_num >= 0.0 && y_num >= 0.0 && x_num <= 1.0 && y_num <= 1.0 {
+        Some((x_num * src_w as f64, y_num * src_h as f64))
+    } else {
+        None
+    }
 }
 
 fn print_help() {
