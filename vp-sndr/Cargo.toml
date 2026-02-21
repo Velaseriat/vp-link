@@ -1,11 +1,11 @@
 [package]
-name = "vp-test"
+name = "vp-sndr"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 ashpd = "0.12"
-cosmic-client-toolkit = { path = "vendor/cosmic-protocols/client-toolkit" }
+cosmic-client-toolkit = { path = "../vp-test/vendor/cosmic-protocols/client-toolkit" }
 evdev = "0.13"
 gstreamer = { version = "0.23", features = ["v1_20"] }
 gstreamer-app = "0.23"

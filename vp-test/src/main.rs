@@ -1,5 +1,19 @@
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::PersistMode;
+use cosmic_client_toolkit::screencopy::{
+    CaptureCursorSession, CaptureFrame, CaptureSession, CaptureSource, FailureReason, Formats,
+    Frame, ScreencopyCursorSessionData, ScreencopyCursorSessionDataExt, ScreencopyHandler,
+    ScreencopyState,
+};
+use cosmic_client_toolkit::sctk;
+use cosmic_client_toolkit::sctk::output::{OutputHandler, OutputState};
+use cosmic_client_toolkit::sctk::registry::{ProvidesRegistryState, RegistryState};
+use cosmic_client_toolkit::sctk::seat::pointer::{PointerEvent, PointerHandler};
+use cosmic_client_toolkit::sctk::seat::{Capability, SeatHandler, SeatState};
+use cosmic_client_toolkit::wayland_client::globals::registry_queue_init as wl_registry_queue_init;
+use cosmic_client_toolkit::wayland_client::protocol::{wl_buffer, wl_output, wl_pointer, wl_seat};
+use cosmic_client_toolkit::wayland_client::{Connection as WlConnection, QueueHandle as WlQueueHandle, WEnum};
+use cosmic_client_toolkit::{delegate_screencopy, wayland_client::delegate_noop};
 use evdev::{Device, EventSummary, EventType, RelativeAxisCode};
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -11,6 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,6 +60,7 @@ fn main() -> ExitCode {
             height,
             duration_secs,
             fps,
+            frame_skip,
             out,
             follow_mouse,
             sample_interval_secs,
@@ -56,6 +72,7 @@ fn main() -> ExitCode {
             height,
             duration_secs,
             fps,
+            frame_skip,
             &out,
             follow_mouse,
             sample_interval_secs,
@@ -87,6 +104,7 @@ enum Cli {
         height: u32,
         duration_secs: u32,
         fps: u32,
+        frame_skip: u32,
         out: PathBuf,
         follow_mouse: bool,
         sample_interval_secs: f64,
@@ -189,6 +207,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             let mut height = DEFAULT_HEIGHT;
             let mut duration_secs = 5u32;
             let mut fps = 10u32;
+            let mut frame_skip = 0u32;
             let mut out = PathBuf::from("vp-record.webm");
             let mut follow_mouse = false;
             let mut sample_interval_secs = DEFAULT_MOUSE_SAMPLE_INTERVAL_SECS;
@@ -239,6 +258,15 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                         fps = next
                             .parse::<u32>()
                             .map_err(|_| format!("invalid --fps value: {next}"))?;
+                        i += 2;
+                    }
+                    "--frame-skip" => {
+                        let next = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing value after --frame-skip".to_string())?;
+                        frame_skip = next
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid --frame-skip value: {next}"))?;
                         i += 2;
                     }
                     "--out" => {
@@ -297,6 +325,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 height,
                 duration_secs,
                 fps,
+                frame_skip,
                 out,
                 follow_mouse,
                 sample_interval_secs,
@@ -580,6 +609,7 @@ fn run_record(
     height: u32,
     duration_secs: u32,
     fps: u32,
+    frame_skip: u32,
     out: &Path,
     follow_mouse: bool,
     sample_interval_secs: f64,
@@ -590,9 +620,20 @@ fn run_record(
         eprintln!("FAIL: frame count is zero.");
         return ExitCode::from(1);
     }
+    let keep_every = frame_skip.saturating_add(1);
+    let mut output_fps = fps / keep_every;
+    if output_fps == 0 {
+        output_fps = 1;
+    }
+    if fps % keep_every != 0 {
+        eprintln!(
+            "WARN: output fps rounded down to {} from {}/{}.",
+            output_fps, fps, keep_every
+        );
+    }
     println!(
-        "Recording {}s at {} fps ({} frames), crop {}x{} at x={}, y={}",
-        duration_secs, fps, frames, width, height, x, y
+        "Recording {}s at capture_fps={} output_fps={} (capture_frames={} keep_every={}), crop {}x{} at x={}, y={}",
+        duration_secs, fps, output_fps, frames, keep_every, width, height, x, y
     );
     if follow_mouse {
         println!(
@@ -619,6 +660,8 @@ fn run_record(
                     height,
                     frames,
                     fps,
+                    output_fps,
+                    frame_skip,
                     out,
                     sample_interval_secs,
                     smoothing,
@@ -638,6 +681,8 @@ fn run_record(
                     "videoscale",
                     "!",
                     "videorate",
+                    "drop-only=true",
+                    &format!("max-rate={output_fps}"),
                     "!",
                     "videocrop",
                     &format!("left={x}"),
@@ -645,7 +690,7 @@ fn run_record(
                     &format!("top={y}"),
                     &format!("bottom=0"),
                     "!",
-                    &format!("video/x-raw,width={width},height={height},framerate={fps}/1"),
+                    &format!("video/x-raw,width={width},height={height},framerate={output_fps}/1"),
                     "!",
                     "vp8enc",
                     "deadline=1",
@@ -701,7 +746,9 @@ fn run_record_follow_live(
     out_w: u32,
     out_h: u32,
     frames: u32,
-    fps: u32,
+    capture_fps: u32,
+    output_fps: u32,
+    frame_skip: u32,
     out: &Path,
     sample_interval_secs: f64,
     smoothing: f64,
@@ -719,7 +766,7 @@ fn run_record_follow_live(
         "appsrc name=src is-live=true format=time do-timestamp=true block=true caps=video/x-raw,format=RGBA,width={},height={},framerate={}/1 ! videoconvert ! vp8enc deadline=1 cpu-used=8 end-usage=cbr target-bitrate=4000000 ! webmmux ! filesink location={}",
         out_w,
         out_h,
-        fps,
+        output_fps,
         out.display()
     );
 
@@ -765,14 +812,27 @@ fn run_record_follow_live(
         }
     };
 
-    let mouse_deltas = match start_mouse_delta_tracker() {
-        Ok(v) => v,
+    let cosmic_cursor = match start_cosmic_cursor_tracker() {
+        Ok(v) => {
+            eprintln!("INFO: COSMIC cursor tracker started.");
+            Some(v)
+        }
         Err(err) => {
-            eprintln!("FAIL: could not start mouse tracker: {err}");
-            return ExitCode::from(1);
+            eprintln!("WARN: COSMIC cursor tracker unavailable: {err}");
+            None
+        }
+    };
+    let mouse_deltas = match start_mouse_delta_tracker() {
+        Ok(v) => Some(v),
+        Err(err) => {
+            eprintln!("WARN: evdev mouse delta fallback unavailable: {err}");
+            None
         }
     };
     let saw_mouse_delta = Arc::new(AtomicBool::new(false));
+    let saw_meta_cursor = Arc::new(AtomicBool::new(false));
+    let saw_cosmic_cursor = Arc::new(AtomicBool::new(false));
+    let logged_meta_probe = Arc::new(AtomicBool::new(false));
 
     let follow_state = Arc::new(Mutex::new(FollowState {
         center_x: x as f64 + out_w as f64 / 2.0,
@@ -787,10 +847,16 @@ fn run_record_follow_live(
     }));
 
     let frame_count = Arc::new(Mutex::new(0u64));
+    let input_frame_count = Arc::new(Mutex::new(0u64));
     let follow_state_cb = Arc::clone(&follow_state);
-    let mouse_deltas_cb = Arc::clone(&mouse_deltas);
+    let mouse_deltas_cb = mouse_deltas.clone();
+    let cosmic_cursor_cb = cosmic_cursor.clone();
     let saw_mouse_delta_cb = Arc::clone(&saw_mouse_delta);
+    let saw_meta_cursor_cb = Arc::clone(&saw_meta_cursor);
+    let saw_cosmic_cursor_cb = Arc::clone(&saw_cosmic_cursor);
+    let logged_meta_probe_cb = Arc::clone(&logged_meta_probe);
     let frame_count_cb = Arc::clone(&frame_count);
+    let input_frame_count_cb = Arc::clone(&input_frame_count);
     let appsrc_cb = appsrc.clone();
 
     appsink.set_callbacks(
@@ -815,20 +881,62 @@ fn run_record_follow_live(
                 let now = Instant::now();
                 let (crop_x, crop_y) = {
                     let mut st = follow_state_cb.lock().map_err(|_| gst::FlowError::Error)?;
-                    let mut deltas = mouse_deltas_cb.lock().map_err(|_| gst::FlowError::Error)?;
-                    st.cursor_x += deltas.0;
-                    st.cursor_y += deltas.1;
+                    let prev_cursor_x = st.cursor_x;
+                    let prev_cursor_y = st.cursor_y;
+                    let mut used_meta_cursor = false;
+                    if let Some((mx, my)) =
+                        extract_cursor_from_sample(&sample, src_w as u32, src_h as u32)
+                    {
+                        st.cursor_x = mx;
+                        st.cursor_y = my;
+                        used_meta_cursor = true;
+                        saw_meta_cursor_cb.store(true, Ordering::Relaxed);
+                    } else if let Some(cosmic_cursor_xy) = &cosmic_cursor_cb {
+                        let mut used_cosmic = false;
+                        if let Ok(guard) = cosmic_cursor_xy.lock() {
+                            if let Some((mx, my)) = *guard {
+                                st.cursor_x = mx;
+                                st.cursor_y = my;
+                                saw_cosmic_cursor_cb.store(true, Ordering::Relaxed);
+                                used_cosmic = true;
+                            }
+                        }
+                        if !used_cosmic {
+                            if let Some(deltas_arc) = &mouse_deltas_cb {
+                                let mut deltas =
+                                    deltas_arc.lock().map_err(|_| gst::FlowError::Error)?;
+                                st.cursor_x += deltas.0;
+                                st.cursor_y += deltas.1;
+                                if deltas.0.abs() > 0.0 || deltas.1.abs() > 0.0 {
+                                    saw_mouse_delta_cb.store(true, Ordering::Relaxed);
+                                }
+                                deltas.0 = 0.0;
+                                deltas.1 = 0.0;
+                            }
+                        }
+                    } else {
+                        if let Some(deltas_arc) = &mouse_deltas_cb {
+                            let mut deltas = deltas_arc.lock().map_err(|_| gst::FlowError::Error)?;
+                            st.cursor_x += deltas.0;
+                            st.cursor_y += deltas.1;
+                            if deltas.0.abs() > 0.0 || deltas.1.abs() > 0.0 {
+                                saw_mouse_delta_cb.store(true, Ordering::Relaxed);
+                            }
+                            deltas.0 = 0.0;
+                            deltas.1 = 0.0;
+                        }
+                    }
+
                     let max_cursor_x = (src_w.saturating_sub(1)) as f64;
                     let max_cursor_y = (src_h.saturating_sub(1)) as f64;
                     st.cursor_x = st.cursor_x.clamp(0.0, max_cursor_x);
                     st.cursor_y = st.cursor_y.clamp(0.0, max_cursor_y);
+                    let cursor_moved =
+                        (st.cursor_x - prev_cursor_x).abs() > 0.001 || (st.cursor_y - prev_cursor_y).abs() > 0.001;
 
-                    if deltas.0.abs() > 0.0 || deltas.1.abs() > 0.0 {
-                        saw_mouse_delta_cb.store(true, Ordering::Relaxed);
+                    if !logged_meta_probe_cb.swap(true, Ordering::Relaxed) {
+                        log_sample_meta_once(&sample, used_meta_cursor);
                     }
-                    deltas.0 = 0.0;
-                    deltas.1 = 0.0;
-                    drop(deltas);
 
                     let left = (st.center_x - out_w as f64 / 2.0).clamp(0.0, (src_w - out_w_us) as f64);
                     let top = (st.center_y - out_h as f64 / 2.0).clamp(0.0, (src_h - out_h_us) as f64);
@@ -844,11 +952,10 @@ fn run_record_follow_live(
                     if !st.follow_active {
                         st.target_x = st.center_x;
                         st.target_y = st.center_y;
-                    } else if now >= st.next_sample_at {
-                        // Keep the 0.5s "acquire target" behavior while following.
+                    } else if cursor_moved || !prev_follow {
+                        // Retarget immediately when the cursor moves while outside the deadzone.
                         st.target_x = st.cursor_x;
                         st.target_y = st.cursor_y;
-                        st.next_sample_at = now + Duration::from_secs_f64(sample_interval_secs);
                     }
 
                     if prev_follow != st.follow_active {
@@ -862,6 +969,7 @@ fn run_record_follow_live(
                             right,
                             bottom
                         );
+                        st.next_sample_at = now + Duration::from_secs_f64(sample_interval_secs);
                     } else if now >= st.next_sample_at {
                         eprintln!(
                             "follow_tick state={} cursor=({:.1},{:.1}) bounds=({:.1},{:.1})-({:.1},{:.1})",
@@ -873,22 +981,7 @@ fn run_record_follow_live(
                             right,
                             bottom
                         );
-                    }
-
-                    if st.follow_active && now >= st.next_sample_at {
-                        // In case follow was just turned on and next_sample_at is in the past,
-                        // avoid repeated immediate updates on consecutive frames.
                         st.next_sample_at = now + Duration::from_secs_f64(sample_interval_secs);
-                    }
-
-                    if st.follow_active && now < st.next_sample_at {
-                        // keep previous target between sample points
-                    } else if st.follow_active {
-                        if now >= st.next_sample_at {
-                            st.target_x = st.cursor_x;
-                            st.target_y = st.cursor_y;
-                            st.next_sample_at = now + Duration::from_secs_f64(sample_interval_secs);
-                        }
                     }
                     let dt = (now - st.last_frame_at).as_secs_f64().max(0.000_001);
                     st.last_frame_at = now;
@@ -901,6 +994,18 @@ fn run_record_follow_live(
                     let y = (st.center_y - out_h as f64 / 2.0).clamp(0.0, max_y).round() as usize;
                     (x, y)
                 };
+
+                let should_emit = {
+                    let mut c = input_frame_count_cb
+                        .lock()
+                        .map_err(|_| gst::FlowError::Error)?;
+                    let idx = *c;
+                    *c += 1;
+                    idx % u64::from(frame_skip.saturating_add(1)) == 0
+                };
+                if !should_emit {
+                    return Ok(gst::FlowSuccess::Ok);
+                }
 
                 let mut out_data = vec![0u8; out_w_us * out_h_us * 4];
                 for row in 0..out_h_us {
@@ -918,8 +1023,9 @@ fn run_record_follow_live(
                         *c += 1;
                         v
                     };
-                    let dur = gst::ClockTime::from_nseconds(1_000_000_000u64 / fps as u64);
-                    let pts = gst::ClockTime::from_nseconds((1_000_000_000u64 * idx) / fps as u64);
+                    let dur = gst::ClockTime::from_nseconds(1_000_000_000u64 / output_fps as u64);
+                    let pts =
+                        gst::ClockTime::from_nseconds((1_000_000_000u64 * idx) / output_fps as u64);
                     let b = out_buf.get_mut().ok_or(gst::FlowError::Error)?;
                     b.set_pts(pts);
                     b.set_duration(dur);
@@ -963,7 +1069,8 @@ fn run_record_follow_live(
         }
     };
 
-    let deadline = Instant::now() + Duration::from_secs((frames as f64 / fps as f64).ceil() as u64 + 20);
+    let deadline =
+        Instant::now() + Duration::from_secs((frames as f64 / capture_fps as f64).ceil() as u64 + 20);
     let mut finished = false;
     while Instant::now() < deadline {
         if let Some(msg) = out_bus.timed_pop(gst::ClockTime::from_mseconds(100)) {
@@ -997,7 +1104,14 @@ fn run_record_follow_live(
 
     let _ = input_pipeline.set_state(gst::State::Null);
     let _ = output_pipeline.set_state(gst::State::Null);
-    if !saw_mouse_delta.load(Ordering::Relaxed) {
+    if saw_meta_cursor.load(Ordering::Relaxed) {
+        eprintln!("INFO: cursor metadata was detected and used.");
+    } else if saw_cosmic_cursor.load(Ordering::Relaxed) {
+        eprintln!("INFO: using COSMIC cursor session coordinates.");
+    } else {
+        eprintln!("INFO: no usable cursor metadata detected; using evdev delta fallback.");
+    }
+    if mouse_deltas.is_some() && !saw_mouse_delta.load(Ordering::Relaxed) {
         eprintln!("WARN: no mouse delta events were captured from /dev/input during recording.");
     }
     if finished {
@@ -1006,6 +1120,55 @@ fn run_record_follow_live(
     } else {
         eprintln!("FAIL: live follow pipeline timed out before EOS");
         ExitCode::from(1)
+    }
+}
+
+fn extract_cursor_from_sample(sample: &gst::Sample, src_w: u32, src_h: u32) -> Option<(f64, f64)> {
+    let buffer = sample.buffer()?;
+    for meta in buffer.iter_meta::<gst::Meta>() {
+        if let Some(custom) = meta.try_as_custom_meta() {
+            let st = custom.structure();
+            let name = st.name().as_str().to_ascii_lowercase();
+            let looks_cursor = name.contains("cursor") || name.contains("pointer");
+            if !looks_cursor {
+                continue;
+            }
+
+            if let Some((x, y)) = read_xy_from_structure(st, src_w, src_h) {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+fn read_xy_from_structure(st: &gst::StructureRef, src_w: u32, src_h: u32) -> Option<(f64, f64)> {
+    let x_num = st.get::<f64>("x").ok().or_else(|| st.get::<i32>("x").ok().map(|v| v as f64))?;
+    let y_num = st.get::<f64>("y").ok().or_else(|| st.get::<i32>("y").ok().map(|v| v as f64))?;
+    if x_num >= 0.0 && y_num >= 0.0 && x_num <= src_w as f64 && y_num <= src_h as f64 {
+        Some((x_num, y_num))
+    } else if x_num >= 0.0 && y_num >= 0.0 && x_num <= 1.0 && y_num <= 1.0 {
+        Some((x_num * src_w as f64, y_num * src_h as f64))
+    } else {
+        None
+    }
+}
+
+fn log_sample_meta_once(sample: &gst::Sample, used_meta_cursor: bool) {
+    if let Some(buffer) = sample.buffer() {
+        let mut parts: Vec<String> = Vec::new();
+        for meta in buffer.iter_meta::<gst::Meta>() {
+            let mut label = meta.api().name().to_string();
+            if let Some(custom) = meta.try_as_custom_meta() {
+                label.push_str(&format!(" custom:{}", custom.structure().name()));
+            }
+            parts.push(label);
+        }
+        eprintln!(
+            "meta_probe used_meta_cursor={} metas=[{}]",
+            used_meta_cursor,
+            parts.join(", ")
+        );
     }
 }
 
@@ -1098,6 +1261,260 @@ fn discover_image_dimensions(path: &Path) -> Option<(u32, u32)> {
         _ => None,
     }
 }
+
+#[derive(Default)]
+struct CursorSessionData {
+    cursor_session_data: ScreencopyCursorSessionData,
+}
+
+impl ScreencopyCursorSessionDataExt for CursorSessionData {
+    fn screencopy_cursor_session_data(&self) -> &ScreencopyCursorSessionData {
+        &self.cursor_session_data
+    }
+}
+
+struct CosmicCursorApp {
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    screencopy_state: ScreencopyState,
+    pointer: Option<wl_pointer::WlPointer>,
+    cursor_session: Option<CaptureCursorSession>,
+    cursor_xy: Arc<Mutex<Option<(f64, f64)>>>,
+    logged_first_cursor: bool,
+}
+
+impl ProvidesRegistryState for CosmicCursorApp {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+
+    sctk::registry_handlers!(OutputState, SeatState);
+}
+
+impl OutputHandler for CosmicCursorApp {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn update_output(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+
+    fn output_destroyed(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl SeatHandler for CosmicCursorApp {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _: &WlConnection, _: &WlQueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &WlConnection,
+        qh: &WlQueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
+                self.pointer = Some(pointer);
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _: &WlConnection, _: &WlQueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for CosmicCursorApp {
+    fn pointer_frame(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        _events: &[PointerEvent],
+    ) {
+    }
+}
+
+impl ScreencopyHandler for CosmicCursorApp {
+    fn screencopy_state(&mut self) -> &mut ScreencopyState {
+        &mut self.screencopy_state
+    }
+
+    fn init_done(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _session: &CaptureSession,
+        _formats: &Formats,
+    ) {
+    }
+
+    fn stopped(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _session: &CaptureSession,
+    ) {
+    }
+
+    fn ready(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _screencopy_frame: &CaptureFrame,
+        _frame: Frame,
+    ) {
+    }
+
+    fn failed(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _screencopy_frame: &CaptureFrame,
+        _reason: WEnum<FailureReason>,
+    ) {
+    }
+
+    fn cursor_position(
+        &mut self,
+        _conn: &WlConnection,
+        _qh: &WlQueueHandle<Self>,
+        _cursor_session: &CaptureCursorSession,
+        x: i32,
+        y: i32,
+    ) {
+        if let Ok(mut cursor_xy) = self.cursor_xy.lock() {
+            *cursor_xy = Some((x as f64, y as f64));
+        }
+        if !self.logged_first_cursor {
+            eprintln!("INFO: first COSMIC cursor event at ({x},{y})");
+            self.logged_first_cursor = true;
+        }
+    }
+}
+
+fn start_cosmic_cursor_tracker() -> Result<Arc<Mutex<Option<(f64, f64)>>>, String> {
+    let cursor_xy = Arc::new(Mutex::new(None));
+    let cursor_xy_thread = Arc::clone(&cursor_xy);
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
+    thread::spawn(move || {
+        if let Err(err) = run_cosmic_cursor_tracker_loop(cursor_xy_thread, ready_tx.clone()) {
+            let _ = ready_tx.send(Err(err));
+        }
+    });
+
+    match ready_rx.recv_timeout(Duration::from_secs(4)) {
+        Ok(Ok(())) => Ok(cursor_xy),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err("timed out initializing COSMIC cursor tracker".to_string()),
+    }
+}
+
+fn run_cosmic_cursor_tracker_loop(
+    cursor_xy: Arc<Mutex<Option<(f64, f64)>>>,
+    ready_tx: mpsc::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let conn = WlConnection::connect_to_env()
+        .map_err(|e| format!("wayland connect failed for cursor tracker: {e}"))?;
+    let (globals, mut event_queue) =
+        wl_registry_queue_init(&conn).map_err(|e| format!("wayland registry init failed: {e}"))?;
+    let qh = event_queue.handle();
+
+    let mut app = CosmicCursorApp {
+        registry_state: RegistryState::new(&globals),
+        output_state: OutputState::new(&globals, &qh),
+        seat_state: SeatState::new(&globals, &qh),
+        screencopy_state: ScreencopyState::new(&globals, &qh),
+        pointer: None,
+        cursor_session: None,
+        cursor_xy,
+        logged_first_cursor: false,
+    };
+
+    event_queue
+        .roundtrip(&mut app)
+        .map_err(|e| format!("initial wayland roundtrip failed: {e}"))?;
+
+    let output = app
+        .output_state
+        .outputs()
+        .next()
+        .ok_or_else(|| "no wl_output available for cursor tracker".to_string())?;
+
+    let wait_deadline = Instant::now() + Duration::from_secs(3);
+    while app.pointer.is_none() && Instant::now() < wait_deadline {
+        event_queue
+            .blocking_dispatch(&mut app)
+            .map_err(|e| format!("waiting for pointer capability failed: {e}"))?;
+    }
+    let pointer = app
+        .pointer
+        .clone()
+        .ok_or_else(|| "no wl_pointer capability available for cursor tracker".to_string())?;
+
+    let cursor_session = app
+        .screencopy_state
+        .capturer()
+        .create_cursor_session(
+            &CaptureSource::Output(output),
+            &pointer,
+            &qh,
+            CursorSessionData::default(),
+        )
+        .map_err(|e| format!("create_cursor_session failed: {e}"))?;
+    app.cursor_session = Some(cursor_session);
+    let _ = ready_tx.send(Ok(()));
+
+    loop {
+        event_queue
+            .blocking_dispatch(&mut app)
+            .map_err(|e| format!("cursor tracker dispatch failed: {e}"))?;
+    }
+}
+
+sctk::delegate_registry!(CosmicCursorApp);
+sctk::delegate_output!(CosmicCursorApp);
+sctk::delegate_seat!(CosmicCursorApp);
+sctk::delegate_pointer!(CosmicCursorApp);
+delegate_screencopy!(CosmicCursorApp);
+delegate_noop!(CosmicCursorApp: ignore wl_buffer::WlBuffer);
 
 fn start_mouse_delta_tracker() -> Result<Arc<Mutex<(f64, f64)>>, String> {
     let mut devices: VecDeque<Device> = VecDeque::new();
@@ -1267,7 +1684,7 @@ fn print_help() {
     println!("  vp-test check");
     println!("  vp-test capture [--timeout-secs N]");
     println!("  vp-test frame [--x N] [--y N] [--width N] [--height N] [--out PATH]");
-    println!("  vp-test record [--x N] [--y N] [--width N] [--height N] [--duration-secs N] [--fps N] [--out PATH] [--follow-mouse] [--sample-interval S] [--smoothing K]");
+    println!("  vp-test record [--x N] [--y N] [--width N] [--height N] [--duration-secs N] [--fps N] [--frame-skip N] [--out PATH] [--follow-mouse] [--sample-interval S] [--smoothing K]");
     println!();
     println!("Commands:");
     println!("  check      Validate session, tools, pipewire plugin, and portal presence.");
