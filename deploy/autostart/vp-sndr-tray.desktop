@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=vp-sndr tray
+Comment=vp-sndr tray controller
+Exec=sh -lc "$HOME/.local/bin/vp-sndr tray"
+Terminal=false
+X-GNOME-Autostart-enabled=true

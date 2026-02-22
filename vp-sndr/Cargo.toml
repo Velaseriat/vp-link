@@ -6,7 +6,12 @@ edition = "2024"
 [dependencies]
 ashpd = "0.12"
 cosmic-client-toolkit = { path = "../vp-test/vendor/cosmic-protocols/client-toolkit" }
+dirs = "5"
 evdev = "0.13"
 gstreamer = { version = "0.23", features = ["v1_20"] }
 gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+ksni = "0.2"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.43", features = ["rt", "time"] }
+toml = "0.8"

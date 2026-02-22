@@ -20,9 +20,16 @@ use evdev::{Device, EventSummary, EventType, RelativeAxisCode};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
+use gstreamer_video as gst_video;
+use ksni::menu::{MenuItem, StandardItem};
+use ksni::{Icon, Tray, TrayService};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::env;
-use std::process::ExitCode;
+use std::fs;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -32,10 +39,97 @@ use std::time::{Duration, Instant};
 const PORTAL_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
-const DEFAULT_MOUSE_SAMPLE_INTERVAL_SECS: f64 = 0.5;
+const DEFAULT_QUEUE_BUFFERS: u32 = 8;
 const DEFAULT_MOUSE_SMOOTHING: f64 = 8.0;
 const DEFAULT_CURSOR_CHANGE_EPSILON_PX: f64 = 0.25;
 const DEFAULT_SETTLE_EPSILON_PX: f64 = 0.75;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SenderConfig {
+    receiver_ip: String,
+    port: u16,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+    follow_mouse: bool,
+    smoothing: f64,
+    encoder: String,
+    bitrate_kbps: u32,
+}
+
+impl Default for SenderConfig {
+    fn default() -> Self {
+        Self {
+            receiver_ip: "127.0.0.1".to_string(),
+            port: 5000,
+            x: 0,
+            y: 0,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            fps: 60,
+            follow_mouse: false,
+            smoothing: DEFAULT_MOUSE_SMOOTHING,
+            encoder: "x265enc".to_string(),
+            bitrate_kbps: 8000,
+        }
+    }
+}
+
+fn config_path() -> Result<PathBuf, String> {
+    let mut dir = dirs::config_dir().ok_or_else(|| "could not resolve config directory".to_string())?;
+    dir.push("vp-link");
+    dir.push("vp-sndr.toml");
+    Ok(dir)
+}
+
+fn load_config() -> SenderConfig {
+    let path = match config_path() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("WARN: {err}");
+            return SenderConfig::default();
+        }
+    };
+    let data = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return SenderConfig::default(),
+    };
+    match toml::from_str::<SenderConfig>(&data) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("WARN: could not parse {}: {err}", path.display());
+            SenderConfig::default()
+        }
+    }
+}
+
+fn save_config(cfg: &SenderConfig) -> Result<(), String> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+    }
+    let data = toml::to_string_pretty(cfg).map_err(|e| format!("serialize config: {e}"))?;
+    fs::write(&path, data).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn cfg_from_send(cfg: &SendCfg) -> SenderConfig {
+    SenderConfig {
+        receiver_ip: cfg.receiver_ip.clone(),
+        port: cfg.port,
+        x: cfg.x,
+        y: cfg.y,
+        width: cfg.width,
+        height: cfg.height,
+        fps: cfg.fps,
+        follow_mouse: cfg.follow_mouse,
+        smoothing: cfg.smoothing,
+        encoder: cfg.encoder.clone(),
+        bitrate_kbps: cfg.bitrate_kbps,
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -43,6 +137,30 @@ fn main() -> ExitCode {
         Ok(Cli::Help) => {
             print_help();
             ExitCode::SUCCESS
+        }
+        Ok(Cli::ConfigPath) => {
+            match config_path() {
+                Ok(path) => println!("{}", path.display()),
+                Err(err) => eprintln!("error: {err}"),
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Cli::Tray) => run_tray(),
+        Ok(Cli::RunSaved) => {
+            let cfg = load_config();
+            run_send(SendCfg {
+                receiver_ip: cfg.receiver_ip,
+                port: cfg.port,
+                x: cfg.x,
+                y: cfg.y,
+                width: cfg.width,
+                height: cfg.height,
+                fps: cfg.fps,
+                follow_mouse: cfg.follow_mouse,
+                smoothing: cfg.smoothing,
+                encoder: cfg.encoder,
+                bitrate_kbps: cfg.bitrate_kbps,
+            })
         }
         Ok(Cli::Send {
             receiver_ip,
@@ -52,27 +170,29 @@ fn main() -> ExitCode {
             width,
             height,
             fps,
-            frame_skip,
             follow_mouse,
-            sample_interval_secs,
             smoothing,
             encoder,
             bitrate_kbps,
-        }) => run_send(SendCfg {
-            receiver_ip,
-            port,
-            x,
-            y,
-            width,
-            height,
-            fps,
-            frame_skip,
-            follow_mouse,
-            sample_interval_secs,
-            smoothing,
-            encoder,
-            bitrate_kbps,
-        }),
+        }) => {
+            let send_cfg = SendCfg {
+                receiver_ip,
+                port,
+                x,
+                y,
+                width,
+                height,
+                fps,
+                follow_mouse,
+                smoothing,
+                encoder,
+                bitrate_kbps,
+            };
+            if let Err(err) = save_config(&cfg_from_send(&send_cfg)) {
+                eprintln!("WARN: {err}");
+            }
+            run_send(send_cfg)
+        }
         Err(err) => {
             eprintln!("error: {err}");
             print_help();
@@ -83,6 +203,9 @@ fn main() -> ExitCode {
 
 enum Cli {
     Help,
+    Tray,
+    ConfigPath,
+    RunSaved,
     Send {
         receiver_ip: String,
         port: u16,
@@ -91,9 +214,7 @@ enum Cli {
         width: u32,
         height: u32,
         fps: u32,
-        frame_skip: u32,
         follow_mouse: bool,
-        sample_interval_secs: f64,
         smoothing: f64,
         encoder: String,
         bitrate_kbps: u32,
@@ -108,12 +229,171 @@ struct SendCfg {
     width: u32,
     height: u32,
     fps: u32,
-    frame_skip: u32,
     follow_mouse: bool,
-    sample_interval_secs: f64,
     smoothing: f64,
     encoder: String,
     bitrate_kbps: u32,
+}
+
+#[derive(Clone, Default)]
+struct SenderTray;
+
+impl Tray for SenderTray {
+    fn id(&self) -> String {
+        "vp-sndr".to_string()
+    }
+
+    fn title(&self) -> String {
+        "vp-sndr".to_string()
+    }
+
+    fn icon_name(&self) -> String {
+        "video-display".to_string()
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        // Fallback icon for trays that do not resolve icon_name from theme.
+        let width = 16i32;
+        let height = 16i32;
+        let mut data = vec![0u8; (width * height * 4) as usize];
+        for px in data.chunks_exact_mut(4) {
+            // ARGB32 network byte order: A, R, G, B.
+            px[0] = 0xFF;
+            px[1] = 0xE5;
+            px[2] = 0x39;
+            px[3] = 0x35;
+        }
+        vec![Icon {
+            width,
+            height,
+            data,
+        }]
+    }
+
+    fn menu(&self) -> Vec<MenuItem<Self>> {
+        let running = service_is_active("vp-sndr.service");
+        let status_label = if running {
+            "Service: running"
+        } else {
+            "Service: stopped"
+        };
+        let mut items = vec![MenuItem::Standard(StandardItem {
+            label: status_label.to_string(),
+            enabled: false,
+            ..Default::default()
+        })];
+        if running {
+            items.push(MenuItem::Standard(StandardItem {
+                label: "Stop Sender".to_string(),
+                activate: Box::new(move |_| tray_stop()),
+                ..Default::default()
+            }));
+        } else {
+            items.push(MenuItem::Standard(StandardItem {
+                label: "Start Sender".to_string(),
+                activate: Box::new(move |_| tray_start()),
+                ..Default::default()
+            }));
+        }
+        items.push(MenuItem::Standard(StandardItem {
+            label: "Open Config".to_string(),
+            activate: Box::new(move |_| tray_open_config()),
+            ..Default::default()
+        }));
+        items.push(MenuItem::Standard(StandardItem {
+            label: "Quit".to_string(),
+            activate: Box::new(move |_| std::process::exit(0)),
+            ..Default::default()
+        }));
+        items
+    }
+}
+
+fn run_tray() -> ExitCode {
+    if let Err(err) = ensure_session_bus_available() {
+        eprintln!("ERROR: {err}");
+        eprintln!("Run `vp-sndr tray` from an active desktop session (not plain SSH).");
+        return ExitCode::from(1);
+    }
+
+    let tray = SenderTray;
+    let service = TrayService::new(tray);
+    let _handle = service.spawn();
+    loop {
+        std::thread::park();
+    }
+}
+
+fn ensure_session_bus_available() -> Result<(), String> {
+    let addr = env::var("DBUS_SESSION_BUS_ADDRESS")
+        .map_err(|_| "DBUS_SESSION_BUS_ADDRESS is not set".to_string())?;
+    if addr.trim().is_empty() {
+        return Err("DBUS_SESSION_BUS_ADDRESS is empty".to_string());
+    }
+
+    let path = if let Some(rest) = addr.strip_prefix("unix:path=") {
+        rest.split(',').next().unwrap_or("")
+    } else if addr.starts_with('/') {
+        addr.as_str()
+    } else {
+        return Err(format!(
+            "unsupported DBus address format: {addr} (expected unix:path=...)"
+        ));
+    };
+
+    if path.is_empty() {
+        return Err(format!("invalid DBus address: {addr}"));
+    }
+
+    UnixStream::connect(path)
+        .map(|_| ())
+        .map_err(|e| format!("cannot connect to session bus at {path}: {e}"))
+}
+
+fn service_is_active(service: &str) -> bool {
+    match Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", service])
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+fn service_action(service: &str, action: &str) {
+    let status = Command::new("systemctl")
+        .args(["--user", action, service])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    if let Err(err) = status {
+        eprintln!("WARN: systemctl --user {action} {service} failed: {err}");
+    }
+}
+
+fn tray_start() {
+    service_action("vp-sndr.service", "start");
+}
+
+fn tray_stop() {
+    service_action("vp-sndr.service", "stop");
+}
+
+fn tray_open_config() {
+    let cfg = load_config();
+    let _ = save_config(&cfg);
+    let path = match config_path() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("WARN: {err}");
+            return;
+        }
+    };
+    let _ = Command::new("xdg-open")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
@@ -122,6 +402,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     }
     match args[1].as_str() {
         "-h" | "--help" | "help" => Ok(Cli::Help),
+        "tray" => Ok(Cli::Tray),
+        "config" => Ok(Cli::ConfigPath),
+        "run-saved" => Ok(Cli::RunSaved),
         "send" => {
             let mut receiver_ip: Option<String> = None;
             let mut port = 5000u16;
@@ -130,9 +413,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             let mut width = DEFAULT_WIDTH;
             let mut height = DEFAULT_HEIGHT;
             let mut fps = 60u32;
-            let mut frame_skip = 0u32;
             let mut follow_mouse = false;
-            let mut sample_interval_secs = DEFAULT_MOUSE_SAMPLE_INTERVAL_SECS;
             let mut smoothing = DEFAULT_MOUSE_SMOOTHING;
             let mut encoder = String::from("x265enc");
             let mut bitrate_kbps = 8000u32;
@@ -201,27 +482,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                             .map_err(|_| format!("invalid --fps value: {next}"))?;
                         i += 2;
                     }
-                    "--frame-skip" => {
-                        let next = args
-                            .get(i + 1)
-                            .ok_or_else(|| "missing value after --frame-skip".to_string())?;
-                        frame_skip = next
-                            .parse::<u32>()
-                            .map_err(|_| format!("invalid --frame-skip value: {next}"))?;
-                        i += 2;
-                    }
                     "--follow-mouse" => {
                         follow_mouse = true;
                         i += 1;
-                    }
-                    "--sample-interval" => {
-                        let next = args
-                            .get(i + 1)
-                            .ok_or_else(|| "missing value after --sample-interval".to_string())?;
-                        sample_interval_secs = next
-                            .parse::<f64>()
-                            .map_err(|_| format!("invalid --sample-interval value: {next}"))?;
-                        i += 2;
                     }
                     "--smoothing" => {
                         let next = args
@@ -259,9 +522,6 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             if fps == 0 {
                 return Err("--fps must be > 0".to_string());
             }
-            if sample_interval_secs <= 0.0 {
-                return Err("--sample-interval must be > 0".to_string());
-            }
             if smoothing <= 0.0 {
                 return Err("--smoothing must be > 0".to_string());
             }
@@ -277,9 +537,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 width,
                 height,
                 fps,
-                frame_skip,
                 follow_mouse,
-                sample_interval_secs,
                 smoothing,
                 encoder,
                 bitrate_kbps,
@@ -290,28 +548,19 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
 }
 
 fn run_send(cfg: SendCfg) -> ExitCode {
-    let keep_every = cfg.frame_skip.saturating_add(1);
-    let mut output_fps = cfg.fps / keep_every;
-    if output_fps == 0 {
-        output_fps = 1;
-    }
+    let output_fps = cfg.fps.max(1);
     println!(
-        "Sending to {}:{} capture_fps={} output_fps={} keep_every={} crop={}x{} at x={}, y={}",
+        "Sending to {}:{} capture_fps={} crop={}x{} at x={}, y={}",
         cfg.receiver_ip,
         cfg.port,
         cfg.fps,
-        output_fps,
-        keep_every,
         cfg.width,
         cfg.height,
         cfg.x,
         cfg.y
     );
     if cfg.follow_mouse {
-        println!(
-            "Mouse follow enabled (sample_interval={}s, smoothing={}).",
-            cfg.sample_interval_secs, cfg.smoothing
-        );
+        println!("Mouse follow enabled (smoothing={}).", cfg.smoothing);
     }
     let sc = match start_portal_screencast() {
         Ok(v) => v,
@@ -339,10 +588,28 @@ struct FollowState {
 
 fn encoder_stage(encoder: &str, fps: u32, bitrate_kbps: u32) -> Result<String, String> {
     match encoder {
-        "x265enc" => Ok(format!(
-            "x265enc tune=zerolatency speed-preset=ultrafast key-int-max={} bitrate={}",
+        "x264enc" => Ok(format!(
+            "x264enc tune=zerolatency speed-preset=ultrafast key-int-max={} bitrate={}",
             fps.max(1),
             bitrate_kbps
+        )),
+        "nvh264enc" => Ok(format!(
+            "nvh264enc bitrate={} gop-size={}",
+            bitrate_kbps,
+            fps.max(1)
+        )),
+        "x265enc" => {
+            let gop = (fps.max(1) * 2).max(30);
+            Ok(format!(
+                "x265enc speed-preset=veryfast key-int-max={} bitrate={} option-string=\"repeat-headers=1:aud=1:scenecut=0\"",
+                gop,
+                bitrate_kbps
+            ))
+        }
+        "nvh265enc" => Ok(format!(
+            "nvh265enc bitrate={} gop-size={}",
+            bitrate_kbps,
+            fps.max(1)
         )),
         "vaapih265enc" => Ok(format!(
             "vaapih265enc rate-control=cbr bitrate={} keyframe-period={}",
@@ -353,6 +620,18 @@ fn encoder_stage(encoder: &str, fps: u32, bitrate_kbps: u32) -> Result<String, S
             "v4l2h265enc extra-controls=\"controls,video_bitrate={}000\"",
             bitrate_kbps
         )),
+        other => Err(format!("unsupported --encoder '{other}'")),
+    }
+}
+
+fn rtp_video_stage(encoder: &str) -> Result<&'static str, String> {
+    match encoder {
+        "x264enc" | "nvh264enc" => {
+            Ok("h264parse config-interval=1 ! rtph264pay pt=96 config-interval=1 mtu=1200")
+        }
+        "x265enc" | "nvh265enc" | "vaapih265enc" | "v4l2h265enc" => {
+            Ok("h265parse config-interval=1 ! rtph265pay pt=96 config-interval=1 mtu=1200")
+        }
         other => Err(format!("unsupported --encoder '{other}'")),
     }
 }
@@ -370,14 +649,21 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let rtp_stage = match rtp_video_stage(&cfg.encoder) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("FAIL: {err}");
+            return ExitCode::from(2);
+        }
+    };
 
     let input_desc = format!(
         "pipewiresrc path={} do-timestamp=true ! videoconvert ! video/x-raw,format=RGBA,framerate={}/1 ! appsink name=sink max-buffers=1 drop=true emit-signals=true sync=false",
         node_id, cfg.fps
     );
     let output_desc = format!(
-        "appsrc name=src is-live=true format=time do-timestamp=true block=true caps=video/x-raw,format=RGBA,width={},height={},framerate={}/1 ! videoconvert ! video/x-raw,format=I420 ! {} ! h265parse config-interval=1 ! rtph265pay pt=96 config-interval=1 mtu=1200 ! udpsink host={} port={} sync=false async=false",
-        cfg.width, cfg.height, output_fps, enc, cfg.receiver_ip, cfg.port
+        "appsrc name=src is-live=true format=time do-timestamp=true block=true caps=video/x-raw,format=RGBA,width={},height={},framerate={}/1 ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! videoconvert ! video/x-raw,format=I420 ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! {} ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! {} ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! udpsink host={} port={} sync=false async=false",
+        cfg.width, cfg.height, output_fps, DEFAULT_QUEUE_BUFFERS, DEFAULT_QUEUE_BUFFERS, enc, DEFAULT_QUEUE_BUFFERS, rtp_stage, DEFAULT_QUEUE_BUFFERS, cfg.receiver_ip, cfg.port
     );
 
     let input_pipeline = match gst::parse::launch(&input_desc) {
@@ -443,11 +729,9 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
         last_frame_at: Instant::now(),
     }));
     let out_idx = Arc::new(Mutex::new(0u64));
-    let in_idx = Arc::new(Mutex::new(0u64));
 
     let follow_state_cb = Arc::clone(&follow_state);
     let out_idx_cb = Arc::clone(&out_idx);
-    let in_idx_cb = Arc::clone(&in_idx);
     let appsrc_cb = appsrc.clone();
     let saw_cosmic_cursor_cb = Arc::clone(&saw_cosmic_cursor);
     let cfg_follow = cfg.follow_mouse;
@@ -456,7 +740,6 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
     let cfg_x = cfg.x;
     let cfg_y = cfg.y;
     let cfg_output_fps = output_fps;
-    let cfg_frame_skip = cfg.frame_skip;
     let cfg_smoothing = cfg.smoothing;
 
     appsink.set_callbacks(
@@ -471,16 +754,6 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
                 let out_h = cfg_height as usize;
                 if src_w < out_w || src_h < out_h {
                     return Err(gst::FlowError::Error);
-                }
-
-                let emit_this = {
-                    let mut c = in_idx_cb.lock().map_err(|_| gst::FlowError::Error)?;
-                    let idx = *c;
-                    *c += 1;
-                    idx % u64::from(cfg_frame_skip.saturating_add(1)) == 0
-                };
-                if !emit_this {
-                    return Ok(gst::FlowSuccess::Ok);
                 }
 
                 let now = Instant::now();
@@ -565,15 +838,31 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
                 };
 
                 let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let (plane0_offset, src_stride) = if let Some(meta) = buffer.meta::<gst_video::VideoMeta>() {
+                    let offset = meta.offset().first().copied().unwrap_or(0);
+                    let stride = meta
+                        .stride()
+                        .first()
+                        .copied()
+                        .filter(|v| *v > 0)
+                        .map(|v| v as usize)
+                        .unwrap_or(src_w * 4);
+                    (offset, stride)
+                } else {
+                    (0usize, src_w * 4)
+                };
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let src = map.as_slice();
-                let src_stride = src_w * 4;
                 let mut out_data = vec![0u8; out_w * out_h * 4];
                 for row in 0..out_h {
-                    let src_off = (crop_y + row) * src_stride + crop_x * 4;
+                    let src_off = plane0_offset + (crop_y + row) * src_stride + crop_x * 4;
                     let dst_off = row * out_w * 4;
+                    let src_end = src_off + out_w * 4;
+                    if src_end > src.len() {
+                        return Err(gst::FlowError::Error);
+                    }
                     out_data[dst_off..dst_off + out_w * 4]
-                        .copy_from_slice(&src[src_off..src_off + out_w * 4]);
+                        .copy_from_slice(&src[src_off..src_end]);
                 }
 
                 let mut out_buf = gst::Buffer::from_mut_slice(out_data);
@@ -1035,5 +1324,14 @@ fn print_help() {
     println!("vp-sndr: HEVC RTP sender");
     println!();
     println!("Usage:");
-    println!("  vp-sndr send --receiver-ip IP [--port N] [--x N] [--y N] [--width N] [--height N] [--fps N] [--frame-skip N] [--follow-mouse] [--sample-interval S] [--smoothing K] [--encoder x265enc|vaapih265enc|v4l2h265enc] [--bitrate-kbps N]");
+    println!("  vp-sndr send --receiver-ip IP [--port N] [--x N] [--y N] [--width N] [--height N] [--fps N] [--follow-mouse] [--smoothing K] [--encoder x264enc|nvh264enc|x265enc|nvh265enc|vaapih265enc|v4l2h265enc] [--bitrate-kbps N]");
+    println!("  vp-sndr tray");
+    println!("  vp-sndr config");
+    println!("  vp-sndr run-saved");
+    println!();
+    println!("Examples:");
+    println!("  vp-sndr send --receiver-ip 192.168.1.50 --port 5000 --x 200 --y 100 --width 1280 --height 720 --fps 60 --encoder x265enc --bitrate-kbps 8000");
+    println!("  vp-sndr tray");
+    println!("  vp-sndr config");
+    println!("  vp-sndr run-saved");
 }

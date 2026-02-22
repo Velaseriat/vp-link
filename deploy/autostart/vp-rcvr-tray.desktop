@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=vp-rcvr tray
+Comment=vp-rcvr tray controller
+Exec=sh -lc "$HOME/.local/bin/vp-rcvr tray"
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,5 +1,207 @@
+use ksni::menu::{MenuItem, StandardItem};
+use ksni::{Tray, TrayService};
+use serde::{Deserialize, Serialize};
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReceiverConfig {
+    codec: String,
+    bind_ip: String,
+    port: u16,
+    payload: u8,
+    clock_rate: u32,
+    latency_ms: u32,
+    no_preview: bool,
+    v4l2_device: Option<String>,
+}
+
+impl Default for ReceiverConfig {
+    fn default() -> Self {
+        Self {
+            codec: "h265".to_string(),
+            bind_ip: "0.0.0.0".to_string(),
+            port: 5000,
+            payload: 96,
+            clock_rate: 90_000,
+            latency_ms: 25,
+            no_preview: false,
+            v4l2_device: None,
+        }
+    }
+}
+
+fn config_path() -> Result<PathBuf, String> {
+    let mut dir = dirs::config_dir().ok_or_else(|| "could not resolve config directory".to_string())?;
+    dir.push("vp-link");
+    dir.push("vp-rcvr.toml");
+    Ok(dir)
+}
+
+fn load_config() -> ReceiverConfig {
+    let path = match config_path() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("WARN: {err}");
+            return ReceiverConfig::default();
+        }
+    };
+    let data = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return ReceiverConfig::default(),
+    };
+    match toml::from_str::<ReceiverConfig>(&data) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("WARN: could not parse {}: {err}", path.display());
+            ReceiverConfig::default()
+        }
+    }
+}
+
+fn save_config(cfg: &ReceiverConfig) -> Result<(), String> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create dir {}: {e}", parent.display()))?;
+    }
+    let data = toml::to_string_pretty(cfg).map_err(|e| format!("serialize config: {e}"))?;
+    fs::write(&path, data).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn cfg_from_receive(
+    codec: &str,
+    bind_ip: &str,
+    port: u16,
+    payload: u8,
+    clock_rate: u32,
+    latency_ms: u32,
+    no_preview: bool,
+    v4l2_device: Option<&str>,
+) -> ReceiverConfig {
+    ReceiverConfig {
+        codec: codec.to_string(),
+        bind_ip: bind_ip.to_string(),
+        port,
+        payload,
+        clock_rate,
+        latency_ms,
+        no_preview,
+        v4l2_device: v4l2_device.map(|v| v.to_string()),
+    }
+}
+
+#[derive(Clone, Default)]
+struct ReceiverTray;
+
+impl Tray for ReceiverTray {
+    fn id(&self) -> String {
+        "vp-rcvr".to_string()
+    }
+
+    fn title(&self) -> String {
+        "vp-rcvr".to_string()
+    }
+
+    fn icon_name(&self) -> String {
+        "video-display".to_string()
+    }
+
+    fn menu(&self) -> Vec<MenuItem<Self>> {
+        let running = service_is_active("vp-rcvr.service");
+        let status_label = if running {
+            "Service: running"
+        } else {
+            "Service: stopped"
+        };
+        let mut items = vec![MenuItem::Standard(StandardItem {
+            label: status_label.to_string(),
+            enabled: false,
+            ..Default::default()
+        })];
+        if running {
+            items.push(MenuItem::Standard(StandardItem {
+                label: "Stop Receiver".to_string(),
+                activate: Box::new(move |_| tray_stop()),
+                ..Default::default()
+            }));
+        } else {
+            items.push(MenuItem::Standard(StandardItem {
+                label: "Start Receiver".to_string(),
+                activate: Box::new(move |_| tray_start()),
+                ..Default::default()
+            }));
+        }
+        items.push(MenuItem::Standard(StandardItem {
+            label: "Open Config".to_string(),
+            activate: Box::new(move |_| tray_open_config()),
+            ..Default::default()
+        }));
+        items.push(MenuItem::Standard(StandardItem {
+            label: "Quit".to_string(),
+            activate: Box::new(move |_| std::process::exit(0)),
+            ..Default::default()
+        }));
+        items
+    }
+}
+
+fn run_tray() -> ExitCode {
+    let tray = ReceiverTray;
+    let service = TrayService::new(tray);
+    let _handle = service.spawn();
+    loop {
+        std::thread::park();
+    }
+}
+
+fn service_is_active(service: &str) -> bool {
+    match Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", service])
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
+}
+
+fn service_action(service: &str, action: &str) {
+    let status = Command::new("systemctl")
+        .args(["--user", action, service])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+    if let Err(err) = status {
+        eprintln!("WARN: systemctl --user {action} {service} failed: {err}");
+    }
+}
+
+fn tray_start() {
+    service_action("vp-rcvr.service", "start");
+}
+
+fn tray_stop() {
+    service_action("vp-rcvr.service", "stop");
+}
+
+fn tray_open_config() {
+    let cfg = load_config();
+    let _ = save_config(&cfg);
+    let path = match config_path() {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("WARN: {err}");
+            return;
+        }
+    };
+    let _ = Command::new("xdg-open")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -8,7 +210,29 @@ fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
+        Ok(Cli::ConfigPath) => {
+            match config_path() {
+                Ok(path) => println!("{}", path.display()),
+                Err(err) => eprintln!("error: {err}"),
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Cli::Tray) => run_tray(),
+        Ok(Cli::RunSaved) => {
+            let cfg = load_config();
+            run_receive(
+                &cfg.codec,
+                &cfg.bind_ip,
+                cfg.port,
+                cfg.payload,
+                cfg.clock_rate,
+                cfg.latency_ms,
+                !cfg.no_preview,
+                cfg.v4l2_device.as_deref(),
+            )
+        }
         Ok(Cli::Receive {
+            codec,
             bind_ip,
             port,
             payload,
@@ -16,15 +240,30 @@ fn main() -> ExitCode {
             latency_ms,
             no_preview,
             v4l2_device,
-        }) => run_receive(
-            &bind_ip,
-            port,
-            payload,
-            clock_rate,
-            latency_ms,
-            !no_preview,
-            v4l2_device.as_deref(),
-        ),
+        }) => {
+            if let Err(err) = save_config(&cfg_from_receive(
+                &codec,
+                &bind_ip,
+                port,
+                payload,
+                clock_rate,
+                latency_ms,
+                no_preview,
+                v4l2_device.as_deref(),
+            )) {
+                eprintln!("WARN: {err}");
+            }
+            run_receive(
+                &codec,
+                &bind_ip,
+                port,
+                payload,
+                clock_rate,
+                latency_ms,
+                !no_preview,
+                v4l2_device.as_deref(),
+            )
+        }
         Err(err) => {
             eprintln!("error: {err}");
             print_help();
@@ -35,7 +274,11 @@ fn main() -> ExitCode {
 
 enum Cli {
     Help,
+    Tray,
+    ConfigPath,
+    RunSaved,
     Receive {
+        codec: String,
         bind_ip: String,
         port: u16,
         payload: u8,
@@ -52,8 +295,12 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     }
     match args[1].as_str() {
         "-h" | "--help" | "help" => Ok(Cli::Help),
+        "tray" => Ok(Cli::Tray),
+        "config" => Ok(Cli::ConfigPath),
+        "run-saved" => Ok(Cli::RunSaved),
         "receive" => {
             let mut bind_ip = String::from("0.0.0.0");
+            let mut codec = String::from("h265");
             let mut port = 5000u16;
             let mut payload = 96u8;
             let mut clock_rate = 90_000u32;
@@ -69,6 +316,17 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                             .get(i + 1)
                             .ok_or_else(|| "missing value after --bind-ip".to_string())?;
                         bind_ip = next.clone();
+                        i += 2;
+                    }
+                    "--codec" => {
+                        let next = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing value after --codec".to_string())?;
+                        let next_lc = next.to_ascii_lowercase();
+                        if next_lc != "h264" && next_lc != "h265" {
+                            return Err(format!("invalid --codec value: {next} (expected h264 or h265)"));
+                        }
+                        codec = next_lc;
                         i += 2;
                     }
                     "--port" => {
@@ -130,6 +388,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             }
 
             Ok(Cli::Receive {
+                codec,
                 bind_ip,
                 port,
                 payload,
@@ -144,6 +403,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
 }
 
 fn run_receive(
+    codec: &str,
     bind_ip: &str,
     port: u16,
     payload: u8,
@@ -152,31 +412,43 @@ fn run_receive(
     preview: bool,
     v4l2_device: Option<&str>,
 ) -> ExitCode {
+    let (encoding_name, depay_parse, decode_chain) = match codec {
+        "h264" => ("H264", "rtph264depay ! h264parse", "decodebin ! videoconvert"),
+        "h265" => (
+            "H265",
+            "rtph265depay ! h265parse",
+            "avdec_h265 output-corrupt=false discard-corrupted-frames=true ! videoconvert",
+        ),
+        other => {
+            eprintln!("FAIL: unsupported codec '{other}'");
+            return ExitCode::from(2);
+        }
+    };
     let caps = format!(
-        "application/x-rtp,media=video,encoding-name=H265,payload={payload},clock-rate={clock_rate}"
+        "application/x-rtp,media=video,encoding-name={encoding_name},payload={payload},clock-rate={clock_rate}"
     );
 
     let mut pipeline = format!(
         "udpsrc address={bind_ip} port={port} caps=\"{caps}\" ! \
-         rtpjitterbuffer latency={latency_ms} drop-on-latency=true ! \
-         rtph265depay ! h265parse ! tee name=t"
+         queue ! rtpjitterbuffer latency={latency_ms} drop-on-latency=true ! \
+         {depay_parse} ! tee name=t"
     );
 
     if preview {
-        pipeline.push_str(
-            " t. ! queue ! decodebin ! videoconvert ! \
-             fpsdisplaysink text-overlay=false video-sink=autovideosink sync=false",
-        );
+        pipeline.push_str(&format!(
+            " t. ! queue ! {} ! fpsdisplaysink text-overlay=false video-sink=autovideosink sync=false",
+            decode_chain
+        ));
     }
 
     if let Some(device) = v4l2_device {
         pipeline.push_str(&format!(
-            " t. ! queue ! decodebin ! videoconvert ! v4l2sink device={} sync=false",
-            device
+            " t. ! queue ! {} ! v4l2sink device={} sync=false",
+            decode_chain, device
         ));
     }
 
-    println!("Starting HEVC receiver on {}:{}...", bind_ip, port);
+    println!("Starting {} receiver on {}:{}...", encoding_name, bind_ip, port);
     println!("Pipeline: {}", pipeline);
 
     let cmd = format!("gst-launch-1.0 -e -v {pipeline}");
@@ -206,10 +478,16 @@ fn print_help() {
     println!("vp-rcvr: HEVC viewport receiver");
     println!();
     println!("Usage:");
-    println!("  vp-rcvr receive [--bind-ip IP] [--port N] [--payload N] [--clock-rate N] [--latency-ms N] [--no-preview] [--v4l2-device /dev/videoN]");
+    println!("  vp-rcvr receive [--codec h264|h265] [--bind-ip IP] [--port N] [--payload N] [--clock-rate N] [--latency-ms N] [--no-preview] [--v4l2-device /dev/videoN]");
+    println!("  vp-rcvr tray");
+    println!("  vp-rcvr config");
+    println!("  vp-rcvr run-saved");
     println!();
     println!("Examples:");
     println!("  vp-rcvr receive --port 5000");
     println!("  vp-rcvr receive --port 5000 --v4l2-device /dev/video10");
     println!("  vp-rcvr receive --port 5000 --no-preview --v4l2-device /dev/video10");
+    println!("  vp-rcvr tray");
+    println!("  vp-rcvr config");
+    println!("  vp-rcvr run-saved");
 }
