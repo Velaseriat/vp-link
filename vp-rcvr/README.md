@@ -1,6 +1,6 @@
 # vp-rcvr
 
-HEVC RTP receiver for OBS preview/loopback usage.
+H264/H265 RTP receiver for preview and OBS loopback usage.
 
 ## Dependencies
 
@@ -13,7 +13,7 @@ HEVC RTP receiver for OBS preview/loopback usage.
 ### Runtime
 
 - `gstreamer1.0-tools`
-- HEVC decode plugins: `gstreamer1.0-libav` and/or hardware decoder plugins
+- H264/H265 decode plugins: `gstreamer1.0-libav` and/or hardware decoder plugins
 - Optional OBS loopback output:
   - `v4l2loopback-dkms`
   - `v4l2loopback-utils`
@@ -50,7 +50,14 @@ cd vp-rcvr
 cargo run --release -- receive --port 5000
 cargo run --release -- receive --port 5000 --v4l2-device /dev/video10
 cargo run --release -- receive --port 5000 --no-preview --v4l2-device /dev/video10
+cargo run --release -- receive --codec h264 --port 5000 --no-preview --v4l2-device /dev/video10 --v4l2-width 1280 --v4l2-height 720 --v4l2-fps 60
 ```
+
+V4L2 loopback output caps are optional and can be forced when OBS has trouble opening the device at the default mode:
+
+- `--v4l2-width`
+- `--v4l2-height`
+- `--v4l2-fps`
 
 Show config path:
 
@@ -81,4 +88,23 @@ Add a rule like:
 
 ```text
 <your-user> ALL=(root) NOPASSWD: /usr/sbin/modprobe
+```
+
+## OBS Bridge Script
+
+`start_obs_bridge.sh` launches `vp-rcvr` in OBS loopback mode with:
+
+- `--no-preview` (no extra preview window)
+- `exclusive_caps=1` on `v4l2loopback`
+- configurable loopback mode via env vars:
+  - `CODEC` (`h264` or `h265`)
+  - `V4L2_WIDTH`
+  - `V4L2_HEIGHT`
+  - `V4L2_FPS`
+
+Example:
+
+```bash
+cd vp-rcvr
+CODEC=h264 V4L2_WIDTH=1280 V4L2_HEIGHT=720 V4L2_FPS=60 ./start_obs_bridge.sh
 ```

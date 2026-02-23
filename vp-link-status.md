@@ -12,8 +12,9 @@ Build a Wayland/COSMIC-compatible viewport streaming system:
 - `vp-sndr/` has a Rust sender binary (`vp-sndr`) for HEVC RTP/UDP from portal PipeWire capture.
   - Supports static crop and `--follow-mouse`.
   - Uses the same live crop engine model as `vp-test` (appsink -> CPU crop -> appsrc).
-- `vp-rcvr/` now also has a Rust receiver binary (`vp-rcvr`) for HEVC over RTP/UDP.
-  - Receives RTP/H265 on UDP and previews via GStreamer sink.
+- `vp-rcvr/` now also has a Rust receiver binary (`vp-rcvr`) for H264/H265 over RTP/UDP.
+  - Receives RTP video on UDP and previews via GStreamer sink.
+  - OBS loopback path (`v4l2loopback`) is working with explicit V4L2 caps and `exclusive_caps=1`.
 - `vp-test/` exists as the active validation project.
 
 ### 2. `vp-test` Commands
@@ -31,8 +32,9 @@ Build a Wayland/COSMIC-compatible viewport streaming system:
 - `--follow-mouse` works in live mode, with lerp controlled by `--smoothing`.
 - COSMIC cursor session tracker is wired in via vendored `cosmic-client-toolkit` and used as absolute cursor source when metadata is unavailable.
 - MVP works end-to-end across sender/receiver:
-  - `vp-sndr` sends cropped HEVC RTP stream.
+  - `vp-sndr` sends cropped RTP stream (validated with H264 in current setup).
   - `vp-rcvr` receives and displays stream.
+  - `vp-rcvr` can feed OBS through `v4l2loopback` using the OBS bridge script.
   - Aspect ratio and viewport shape are correct.
 
 ## Dependencies
@@ -89,16 +91,17 @@ gst-inspect-1.0 avdec_h265
 
 - Cursor coordinate alignment still needs real-session validation under multi-monitor / scaling combinations.
 - Current follow pipeline does CPU-side RGBA crop; performance tuning is still pending for high FPS + long sessions.
-- `vp-sndr`/`vp-rcvr` do not yet expose a direct OBS virtual-camera output path by default (can be added via loopback sink path).
+- Loopback mode selection still benefits from explicit V4L2 caps (width/height/fps) for stable OBS startup across hosts.
 
 ## Next Steps
 
 1. Daily MVP run commands:
    - Receiver: `cd vp-rcvr && cargo run --release -- receive --port 5000`
+   - Receiver OBS bridge (H264 example): `cd vp-rcvr && CODEC=h264 V4L2_WIDTH=1280 V4L2_HEIGHT=720 V4L2_FPS=60 ./start_obs_bridge.sh`
    - Sender static crop: `cd vp-sndr && cargo run --release --offline -- send --receiver-ip <RECEIVER_IP> --port 5000 --x 200 --y 100 --width 1280 --height 720 --fps 60 --encoder x265enc --bitrate-kbps 8000`
    - Sender mouse-follow: `cd vp-sndr && cargo run --release --offline -- send --receiver-ip <RECEIVER_IP> --port 5000 --x 200 --y 100 --width 1280 --height 720 --fps 60 --follow-mouse --smoothing 8 --encoder x265enc --bitrate-kbps 8000`
 2. Add sender telemetry counters (capture fps/output fps/drop counts/encode latency).
-3. Add receiver output mode for OBS-friendly loopback source.
+3. Make receiver loopback caps auto-follow decoded stream caps when OBS can accept them, with explicit caps as override.
 
 ## Installable Runtime Model
 
