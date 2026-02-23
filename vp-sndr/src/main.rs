@@ -55,6 +55,7 @@ struct SenderConfig {
     fps: u32,
     follow_mouse: bool,
     smoothing: f64,
+    deadzone: f64,
     encoder: String,
     bitrate_kbps: u32,
 }
@@ -71,6 +72,7 @@ impl Default for SenderConfig {
             fps: 60,
             follow_mouse: false,
             smoothing: DEFAULT_MOUSE_SMOOTHING,
+            deadzone: 0.0,
             encoder: "x265enc".to_string(),
             bitrate_kbps: 8000,
         }
@@ -126,6 +128,7 @@ fn cfg_from_send(cfg: &SendCfg) -> SenderConfig {
         fps: cfg.fps,
         follow_mouse: cfg.follow_mouse,
         smoothing: cfg.smoothing,
+        deadzone: cfg.deadzone,
         encoder: cfg.encoder.clone(),
         bitrate_kbps: cfg.bitrate_kbps,
     }
@@ -158,6 +161,7 @@ fn main() -> ExitCode {
                 fps: cfg.fps,
                 follow_mouse: cfg.follow_mouse,
                 smoothing: cfg.smoothing,
+                deadzone: cfg.deadzone,
                 encoder: cfg.encoder,
                 bitrate_kbps: cfg.bitrate_kbps,
             })
@@ -172,6 +176,7 @@ fn main() -> ExitCode {
             fps,
             follow_mouse,
             smoothing,
+            deadzone,
             encoder,
             bitrate_kbps,
         }) => {
@@ -185,6 +190,7 @@ fn main() -> ExitCode {
                 fps,
                 follow_mouse,
                 smoothing,
+                deadzone,
                 encoder,
                 bitrate_kbps,
             };
@@ -216,6 +222,7 @@ enum Cli {
         fps: u32,
         follow_mouse: bool,
         smoothing: f64,
+        deadzone: f64,
         encoder: String,
         bitrate_kbps: u32,
     },
@@ -231,6 +238,7 @@ struct SendCfg {
     fps: u32,
     follow_mouse: bool,
     smoothing: f64,
+    deadzone: f64,
     encoder: String,
     bitrate_kbps: u32,
 }
@@ -415,6 +423,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             let mut fps = 60u32;
             let mut follow_mouse = false;
             let mut smoothing = DEFAULT_MOUSE_SMOOTHING;
+            let mut deadzone = 0.0f64;
             let mut encoder = String::from("x265enc");
             let mut bitrate_kbps = 8000u32;
 
@@ -495,6 +504,15 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                             .map_err(|_| format!("invalid --smoothing value: {next}"))?;
                         i += 2;
                     }
+                    "--deadzone" => {
+                        let next = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing value after --deadzone".to_string())?;
+                        deadzone = next
+                            .parse::<f64>()
+                            .map_err(|_| format!("invalid --deadzone value: {next}"))?;
+                        i += 2;
+                    }
                     "--encoder" => {
                         let next = args
                             .get(i + 1)
@@ -525,6 +543,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             if smoothing <= 0.0 {
                 return Err("--smoothing must be > 0".to_string());
             }
+            if !(0.0..=100.0).contains(&deadzone) {
+                return Err("--deadzone must be between 0 and 100".to_string());
+            }
             if bitrate_kbps == 0 {
                 return Err("--bitrate-kbps must be > 0".to_string());
             }
@@ -539,6 +560,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 fps,
                 follow_mouse,
                 smoothing,
+                deadzone,
                 encoder,
                 bitrate_kbps,
             })
@@ -561,6 +583,9 @@ fn run_send(cfg: SendCfg) -> ExitCode {
     );
     if cfg.follow_mouse {
         println!("Mouse follow enabled (smoothing={}).", cfg.smoothing);
+        if cfg.deadzone > 0.0 {
+            println!("Deadzone enabled ({}% x {}%).", cfg.deadzone, cfg.deadzone);
+        }
     }
     let sc = match start_portal_screencast() {
         Ok(v) => v,
@@ -741,6 +766,7 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
     let cfg_y = cfg.y;
     let cfg_output_fps = output_fps;
     let cfg_smoothing = cfg.smoothing;
+    let cfg_deadzone = cfg.deadzone;
 
     appsink.set_callbacks(
         AppSinkCallbacks::builder()
@@ -803,8 +829,34 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
                         let cursor_changed = (st.cursor_x - prev_cursor_x).abs() > DEFAULT_CURSOR_CHANGE_EPSILON_PX
                             || (st.cursor_y - prev_cursor_y).abs() > DEFAULT_CURSOR_CHANGE_EPSILON_PX;
                         if cursor_changed {
-                            st.target_x = st.cursor_x;
-                            st.target_y = st.cursor_y;
+                            if cfg_deadzone > 0.0 {
+                                let dz_half_w = (cfg_width as f64) * (cfg_deadzone / 100.0) / 2.0;
+                                let dz_half_h = (cfg_height as f64) * (cfg_deadzone / 100.0) / 2.0;
+                                let left = st.center_x - dz_half_w;
+                                let right = st.center_x + dz_half_w;
+                                let top = st.center_y - dz_half_h;
+                                let bottom = st.center_y + dz_half_h;
+
+                                let target_x = if st.cursor_x < left {
+                                    st.cursor_x + dz_half_w
+                                } else if st.cursor_x > right {
+                                    st.cursor_x - dz_half_w
+                                } else {
+                                    st.center_x
+                                };
+                                let target_y = if st.cursor_y < top {
+                                    st.cursor_y + dz_half_h
+                                } else if st.cursor_y > bottom {
+                                    st.cursor_y - dz_half_h
+                                } else {
+                                    st.center_y
+                                };
+                                st.target_x = target_x;
+                                st.target_y = target_y;
+                            } else {
+                                st.target_x = st.cursor_x;
+                                st.target_y = st.cursor_y;
+                            }
                             st.is_lerping = true;
                         }
                     } else {
@@ -1324,13 +1376,13 @@ fn print_help() {
     println!("vp-sndr: HEVC RTP sender");
     println!();
     println!("Usage:");
-    println!("  vp-sndr send --receiver-ip IP [--port N] [--x N] [--y N] [--width N] [--height N] [--fps N] [--follow-mouse] [--smoothing K] [--encoder x264enc|nvh264enc|x265enc|nvh265enc|vaapih265enc|v4l2h265enc] [--bitrate-kbps N]");
+    println!("  vp-sndr send --receiver-ip IP [--port N] [--x N] [--y N] [--width N] [--height N] [--fps N] [--follow-mouse] [--smoothing K] [--deadzone PCT] [--encoder x264enc|nvh264enc|x265enc|nvh265enc|vaapih265enc|v4l2h265enc] [--bitrate-kbps N]");
     println!("  vp-sndr tray");
     println!("  vp-sndr config");
     println!("  vp-sndr run-saved");
     println!();
     println!("Examples:");
-    println!("  vp-sndr send --receiver-ip 192.168.1.50 --port 5000 --x 200 --y 100 --width 1280 --height 720 --fps 60 --encoder x265enc --bitrate-kbps 8000");
+    println!("  vp-sndr send --receiver-ip 192.168.1.50 --port 5000 --x 200 --y 100 --width 1280 --height 720 --fps 60 --follow-mouse --smoothing 4 --deadzone 30 --encoder x265enc --bitrate-kbps 8000");
     println!("  vp-sndr tray");
     println!("  vp-sndr config");
     println!("  vp-sndr run-saved");
