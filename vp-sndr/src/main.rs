@@ -619,7 +619,7 @@ fn encoder_stage(encoder: &str, fps: u32, bitrate_kbps: u32) -> Result<String, S
             bitrate_kbps
         )),
         "nvh264enc" => Ok(format!(
-            "nvh264enc bitrate={} gop-size={}",
+            "nvh264enc preset=low-latency-hq rc-mode=cbr bitrate={} gop-size={} zerolatency=true bframes=0",
             bitrate_kbps,
             fps.max(1)
         )),
@@ -632,7 +632,7 @@ fn encoder_stage(encoder: &str, fps: u32, bitrate_kbps: u32) -> Result<String, S
             ))
         }
         "nvh265enc" => Ok(format!(
-            "nvh265enc bitrate={} gop-size={}",
+            "nvh265enc preset=low-latency-hq rc-mode=cbr bitrate={} gop-size={} zerolatency=true bframes=0",
             bitrate_kbps,
             fps.max(1)
         )),

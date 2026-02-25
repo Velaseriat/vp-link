@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "[vp-link] stopping sender/related processes..."
+PORT="${PORT:-5000}"
+
+echo "[vp-link] stopping sender processes (port=${PORT})..."
 pkill -f "vp-sndr.*send" 2>/dev/null || true
 pkill -f "vp-sndr.*run-saved" 2>/dev/null || true
-pkill -f "gst-launch-1.0.*(h265|hevc|rtph265pay|rtph265depay)" 2>/dev/null || true
+pkill -f "gst-launch.*port=${PORT}" 2>/dev/null || true
+
+sleep 0.5
 
 rm -f /tmp/vp-sndr.pid
 

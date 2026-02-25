@@ -240,6 +240,8 @@ fn main() -> ExitCode {
                 cfg.clock_rate,
                 cfg.latency_ms,
                 !cfg.no_preview,
+                None,
+                None,
                 cfg.v4l2_device.as_deref(),
                 cfg.v4l2_width,
                 cfg.v4l2_height,
@@ -254,6 +256,8 @@ fn main() -> ExitCode {
             clock_rate,
             latency_ms,
             no_preview,
+            preview_width,
+            preview_height,
             v4l2_device,
             v4l2_width,
             v4l2_height,
@@ -282,6 +286,8 @@ fn main() -> ExitCode {
                 clock_rate,
                 latency_ms,
                 !no_preview,
+                preview_width,
+                preview_height,
                 v4l2_device.as_deref(),
                 v4l2_width,
                 v4l2_height,
@@ -309,6 +315,8 @@ enum Cli {
         clock_rate: u32,
         latency_ms: u32,
         no_preview: bool,
+        preview_width: Option<u32>,
+        preview_height: Option<u32>,
         v4l2_device: Option<String>,
         v4l2_width: Option<u32>,
         v4l2_height: Option<u32>,
@@ -333,6 +341,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             let mut clock_rate = 90_000u32;
             let mut latency_ms = 25u32;
             let mut no_preview = false;
+            let mut preview_width: Option<u32> = None;
+            let mut preview_height: Option<u32> = None;
             let mut v4l2_device: Option<String> = None;
             let mut v4l2_width: Option<u32> = None;
             let mut v4l2_height: Option<u32> = None;
@@ -399,6 +409,32 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                         no_preview = true;
                         i += 1;
                     }
+                    "--preview-width" => {
+                        let next = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing value after --preview-width".to_string())?;
+                        let val = next
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid --preview-width value: {next}"))?;
+                        if val == 0 {
+                            return Err("--preview-width must be > 0".to_string());
+                        }
+                        preview_width = Some(val);
+                        i += 2;
+                    }
+                    "--preview-height" => {
+                        let next = args
+                            .get(i + 1)
+                            .ok_or_else(|| "missing value after --preview-height".to_string())?;
+                        let val = next
+                            .parse::<u32>()
+                            .map_err(|_| format!("invalid --preview-height value: {next}"))?;
+                        if val == 0 {
+                            return Err("--preview-height must be > 0".to_string());
+                        }
+                        preview_height = Some(val);
+                        i += 2;
+                    }
                     "--v4l2-device" => {
                         let next = args
                             .get(i + 1)
@@ -464,6 +500,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 clock_rate,
                 latency_ms,
                 no_preview,
+                preview_width,
+                preview_height,
                 v4l2_device,
                 v4l2_width,
                 v4l2_height,
@@ -482,6 +520,8 @@ fn run_receive(
     clock_rate: u32,
     latency_ms: u32,
     preview: bool,
+    preview_width: Option<u32>,
+    preview_height: Option<u32>,
     v4l2_device: Option<&str>,
     v4l2_width: Option<u32>,
     v4l2_height: Option<u32>,
@@ -492,7 +532,7 @@ fn run_receive(
         "h265" => (
             "H265",
             "rtph265depay ! h265parse",
-            "avdec_h265 output-corrupt=false discard-corrupted-frames=true",
+            "nvh265dec ! cudadownload ! videoconvert",
         ),
         other => {
             eprintln!("FAIL: unsupported codec '{other}'");
@@ -504,15 +544,26 @@ fn run_receive(
     );
 
     let mut pipeline = format!(
-        "udpsrc address={bind_ip} port={port} caps=\"{caps}\" ! \
+        "udpsrc address={bind_ip} port={port} buffer-size=4194304 caps=\"{caps}\" ! \
          queue ! rtpjitterbuffer latency={latency_ms} drop-on-latency=true ! \
          {depay_parse} ! {decode_chain} ! tee name=t"
     );
 
     if preview {
-        pipeline.push_str(
-            " t. ! queue ! videoconvert ! fpsdisplaysink text-overlay=false video-sink=autovideosink sync=false",
-        );
+        let mut preview_scale_caps = String::new();
+        if preview_width.is_some() || preview_height.is_some() {
+            preview_scale_caps.push_str(" ! videoscale ! video/x-raw");
+            if let Some(w) = preview_width {
+                preview_scale_caps.push_str(&format!(",width={w}"));
+            }
+            if let Some(h) = preview_height {
+                preview_scale_caps.push_str(&format!(",height={h}"));
+            }
+        }
+        pipeline.push_str(&format!(
+            " t. ! queue ! videoconvert{} ! fpsdisplaysink text-overlay=false video-sink=autovideosink sync=false",
+            preview_scale_caps
+        ));
     }
 
     if let Some(device) = v4l2_device {
@@ -527,7 +578,7 @@ fn run_receive(
             v4l2_caps.push_str(&format!(",framerate={fps}/1"));
         }
         pipeline.push_str(&format!(
-            " t. ! queue ! videoconvert ! {} ! v4l2sink device={} sync=false",
+            " t. ! queue ! videoconvert ! {} ! v4l2sink device={} io-mode=rw sync=false",
             v4l2_caps, device
         ));
     }
@@ -562,13 +613,14 @@ fn print_help() {
     println!("vp-rcvr: HEVC viewport receiver");
     println!();
     println!("Usage:");
-    println!("  vp-rcvr receive [--codec h264|h265] [--bind-ip IP] [--port N] [--payload N] [--clock-rate N] [--latency-ms N] [--no-preview] [--v4l2-device /dev/videoN] [--v4l2-width N] [--v4l2-height N] [--v4l2-fps N]");
+    println!("  vp-rcvr receive [--codec h264|h265] [--bind-ip IP] [--port N] [--payload N] [--clock-rate N] [--latency-ms N] [--no-preview] [--preview-width N] [--preview-height N] [--v4l2-device /dev/videoN] [--v4l2-width N] [--v4l2-height N] [--v4l2-fps N]");
     println!("  vp-rcvr tray");
     println!("  vp-rcvr config");
     println!("  vp-rcvr run-saved");
     println!();
     println!("Examples:");
     println!("  vp-rcvr receive --port 5000");
+    println!("  vp-rcvr receive --port 5000 --preview-width 1280 --preview-height 720");
     println!("  vp-rcvr receive --port 5000 --v4l2-device /dev/video10");
     println!("  vp-rcvr receive --port 5000 --no-preview --v4l2-device /dev/video10");
     println!("  vp-rcvr receive --codec h264 --port 5000 --no-preview --v4l2-device /dev/video10 --v4l2-width 1280 --v4l2-height 720 --v4l2-fps 60");

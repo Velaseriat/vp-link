@@ -5,20 +5,21 @@ RECEIVER_IP="${RECEIVER_IP:-10.0.0.11}"
 PORT="${PORT:-5000}"
 X="${X:-}"
 Y="${Y:-}"
-WIDTH="${WIDTH:-1280}"
-HEIGHT="${HEIGHT:-720}"
+WIDTH="${WIDTH:-1600}"
+HEIGHT="${HEIGHT:-900}"
 FPS="${FPS:-60}"
 FOLLOW_MOUSE="${FOLLOW_MOUSE:-1}"
 SMOOTHING="${SMOOTHING:-4}"
 DEADZONE="${DEADZONE:-25}"
-ENCODER="${ENCODER:-x264enc}"
-BITRATE_KBPS="${BITRATE_KBPS:-8000}"
+ENCODER="${ENCODER:-nvh265enc}"
+BITRATE_KBPS="${BITRATE_KBPS:-16000}"
 REPO_DIR="${REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 LOG_PATH="${LOG_PATH:-/tmp/vp-sndr-send.log}"
 
 echo "[vp-link] stopping old sender processes..."
 pkill -f "vp-sndr.*send" 2>/dev/null || true
-sleep 0.2
+pkill -f "gst-launch.*port=${PORT}" 2>/dev/null || true
+sleep 0.3
 
 echo "[vp-link] starting sender -> ${RECEIVER_IP}:${PORT}..."
 cd "${REPO_DIR}"

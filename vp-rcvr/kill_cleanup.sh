@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PORT="${PORT:-5000}"
 VIDEO_NR="${VIDEO_NR:-10}"
 UNLOAD_LOOPBACK="${UNLOAD_LOOPBACK:-1}"
 VIDEO_DEV="/dev/video${VIDEO_NR}"
 
-echo "[vp-link] stopping processes..."
+echo "[vp-link] stopping processes (port=${PORT})..."
 pkill -9 obs 2>/dev/null || true
 pkill -f "vp-rcvr.*receive" 2>/dev/null || true
-pkill -f "vp-sndr.*send" 2>/dev/null || true
-pkill -f "gst-launch-1.0.*(h265|hevc|rtph265pay|rtph265depay|v4l2sink)" 2>/dev/null || true
+pkill -f "gst-launch.*port=${PORT}" 2>/dev/null || true
 
 sleep 1
+
+# Mop up anything still holding the loopback device
+if [[ -e "${VIDEO_DEV}" ]]; then
+  sudo fuser -k "${VIDEO_DEV}" 2>/dev/null || true
+fi
 
 if [[ "${UNLOAD_LOOPBACK}" == "1" ]]; then
   echo "[vp-link] attempting to unload v4l2loopback..."
