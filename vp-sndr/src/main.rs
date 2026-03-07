@@ -682,13 +682,35 @@ fn run_send_live(node_id: u32, cfg: SendCfg, output_fps: u32) -> ExitCode {
         }
     };
 
+    let is_nvenc = matches!(cfg.encoder.as_str(), "nvh264enc" | "nvh265enc");
+
     let input_desc = format!(
         "pipewiresrc path={} do-timestamp=true ! videoconvert ! video/x-raw,format=RGBA,framerate={}/1 ! appsink name=sink max-buffers=1 drop=true emit-signals=true sync=false",
         node_id, cfg.fps
     );
+
+    let pre_encode = if is_nvenc {
+        "cudaupload".to_string()
+    } else {
+        format!(
+            "videoconvert ! video/x-raw,format=I420 ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0",
+            DEFAULT_QUEUE_BUFFERS
+        )
+    };
     let output_desc = format!(
-        "appsrc name=src is-live=true format=time do-timestamp=true block=true caps=video/x-raw,format=RGBA,width={},height={},framerate={}/1 ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! videoconvert ! video/x-raw,format=I420 ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! {} ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! {} ! queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! udpsink host={} port={} sync=false async=false",
-        cfg.width, cfg.height, output_fps, DEFAULT_QUEUE_BUFFERS, DEFAULT_QUEUE_BUFFERS, enc, DEFAULT_QUEUE_BUFFERS, rtp_stage, DEFAULT_QUEUE_BUFFERS, cfg.receiver_ip, cfg.port
+        "appsrc name=src is-live=true format=time do-timestamp=true block=true \
+         caps=video/x-raw,format=RGBA,width={},height={},framerate={}/1 ! \
+         queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! \
+         {} ! {} ! \
+         queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! {} ! \
+         queue max-size-buffers={} max-size-bytes=0 max-size-time=0 ! \
+         udpsink host={} port={} sync=false async=false",
+        cfg.width, cfg.height, output_fps,
+        DEFAULT_QUEUE_BUFFERS,
+        pre_encode, enc,
+        DEFAULT_QUEUE_BUFFERS, rtp_stage,
+        DEFAULT_QUEUE_BUFFERS,
+        cfg.receiver_ip, cfg.port
     );
 
     let input_pipeline = match gst::parse::launch(&input_desc) {
